@@ -525,3 +525,303 @@ def call_llm_api(prompt: str, config: Dict[str, Any], default_config: Dict[str, 
             thread_name = threading.current_thread().name
             logger.info(f"线程 {thread_name} (重试者) - 在finally块中解除速率限制")
             rate_limiter.release_rate_limit(current_thread_id)
+
+def call_llm_api_with_openai_sdk(prompt: str, config: Dict[str, Any], default_config: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    使用OpenAI SDK调用LLM API的实验性函数。
+    
+    支持流式(stream)和非流式两种模式，在流式模式下，将累积所有的流式响应后返回。
+    使用标准的OpenAI SDK错误处理方式，并与现有的速率限制机制兼容。
+    
+    参数:
+        prompt: 发送给LLM的提示文本
+        config: 用户提供的配置字典，控制API的行为
+        default_config: 默认配置字典，在用户配置缺失时使用
+        
+    返回:
+        Dict[str, Any]: 成功时返回{'success': True, 'data': 响应数据}
+                       失败时返回{'success': False, 'error': 错误信息, 'error_code': 错误码}
+    """
+    # 尝试导入OpenAI SDK
+    try:
+        from openai import OpenAI, OpenAIError, RateLimitError, APITimeoutError, APIConnectionError
+    except ImportError:
+        error_msg = "无法导入OpenAI SDK。请确保已通过 'pip install openai' 安装了OpenAI SDK。"
+        logger.error(error_msg)
+        return {'success': False, 'error': error_msg, 'error_code': -999}
+    
+    # 获取配置
+    max_retries = config.get("max_retries", default_config["max_retries"])
+    retry_delay = config.get("retry_delay", default_config["retry_delay"])
+    api_call_interval = config.get("api_call_interval", default_config["api_call_interval"])
+    verbose = config.get("verbose", default_config["verbose"])
+    
+    # 获取API令牌
+    api_token = config.get("api_token")
+    
+    # 获取是否使用流式模式
+    use_streaming = config.get("stream", default_config.get("stream", False))
+    
+    # 准备API URL (base_url)
+    api_url = config.get("api_url", default_config["api_url"])
+    
+    # 线程标识
+    current_thread_id = threading.get_ident()
+    thread_name = threading.current_thread().name
+    # 标记此次调用中当前线程是否为429重试者
+    is_429_retrier = False
+    
+    # 重试计数和错误结果暂存
+    attempt = 0
+    result = None
+    
+    # 使用try-finally确保资源清理
+    try:
+        # 主循环
+        while True:
+            # 1. 首先检查API调用间隔
+            rate_limiter.wait_for_interval(api_call_interval, verbose)
+            
+            # 2. 然后检查全局速率限制状态
+            current_retrier = rate_limiter.get_retrier_id()
+            # 如果当前存在速率限制，并且当前线程不是重试者，则等待
+            if rate_limiter.is_rate_limited() and current_thread_id != current_retrier:
+                if verbose:
+                    logger.info(f"线程 {thread_name} - 全局速率限制已激活，且本线程不是重试者，等待解除...")
+                # 等待全局限制解除，添加5分钟超时
+                wait_success = rate_limiter.wait_for_rate_limit_release(verbose, timeout=300)
+                if not wait_success:
+                    logger.warning(f"线程 {thread_name} - 等待超时，将作为新线程继续...")
+                # 重要：解除后继续循环，重新检查所有条件
+                continue
+            
+            # 3. 执行API请求
+            try:
+                if verbose:
+                    logger.info(f"线程 {thread_name} - 准备发送OpenAI SDK请求...")
+                
+                # 再次确认速率限制状态（双重检查）
+                if rate_limiter.is_rate_limited() and current_thread_id != rate_limiter.get_retrier_id():
+                    if verbose:
+                        logger.info(f"线程 {thread_name} - 双重检查：速率限制已激活，且本线程不是重试者，跳过请求...")
+                    continue  # 立即跳过此次请求尝试
+                
+                # 初始化OpenAI客户端
+                client = OpenAI(
+                    api_key=api_token,
+                    base_url=api_url
+                )
+                
+                # 准备消息
+                messages = [{"role": "user", "content": prompt}]
+                
+                # 准备API参数
+                kwargs = {}
+                # 添加模型参数
+                if config.get("model") is not DEFAULT:
+                    kwargs["model"] = config.get("model")
+                
+                # 添加其他参数
+                for param in ["max_tokens", "temperature", "top_p", "frequency_penalty", "n"]:
+                    if config.get(param) is not DEFAULT:
+                        kwargs[param] = config.get(param)
+                
+                # 特殊处理响应格式
+                if config.get("response_format") is not DEFAULT:
+                    kwargs["response_format"] = config.get("response_format")
+                
+                # 特殊处理停止词
+                if config.get("stop") is not DEFAULT:
+                    kwargs["stop"] = config.get("stop")
+                
+                # 处理extra_body
+                extra_body = config.get("extra_body", DEFAULT)
+                if extra_body is not DEFAULT:
+                    if isinstance(extra_body, dict):
+                        # 将extra_body合并到kwargs中
+                        kwargs.update(extra_body)
+                
+                # 执行API调用
+                if use_streaming:
+                    # 流式模式
+                    if verbose:
+                        logger.info(f"线程 {thread_name} - 使用流式模式发送请求")
+                    
+                    # 创建流式请求
+                    stream = client.chat.completions.create(
+                        messages=messages,
+                        stream=True,
+                        **kwargs
+                    )
+                    
+                    # 收集流式响应
+                    collected_content = ""
+                    collected_reasoning = ""
+                    last_usage = None
+                    
+                    # 处理流式响应
+                    for chunk in stream:
+                        if chunk.choices and len(chunk.choices) > 0:
+                            # 处理常规content
+                            if hasattr(chunk.choices[0], 'delta') and hasattr(chunk.choices[0].delta, 'content') and chunk.choices[0].delta.content is not None:
+                                content_piece = chunk.choices[0].delta.content
+                                collected_content += content_piece
+                                if verbose and len(collected_content) % 100 == 0:
+                                    logger.debug(f"线程 {thread_name} - 已收集 {len(collected_content)} 字符的流式响应")
+                            
+                            # 处理reasoning_content（如果存在）
+                            if hasattr(chunk.choices[0], 'delta') and hasattr(chunk.choices[0].delta, 'reasoning_content') and chunk.choices[0].delta.reasoning_content is not None:
+                                reasoning_piece = chunk.choices[0].delta.reasoning_content
+                                collected_reasoning += reasoning_piece
+                                if verbose and len(collected_reasoning) % 100 == 0:
+                                    logger.debug(f"线程 {thread_name} - 已收集 {len(collected_reasoning)} 字符的推理内容")
+                        
+                        # 更新使用情况统计信息
+                        if hasattr(chunk, 'usage'):
+                            last_usage = chunk.usage
+                    
+                    # 创建完整的响应对象
+                    response_data = {
+                        "choices": [
+                            {
+                                "message": {
+                                    "role": "assistant",
+                                    "content": collected_content,
+                                    "reasoning_content": collected_reasoning  # 添加收集到的reasoning内容
+                                },
+                                "index": 0,
+                                "finish_reason": "stop"  # 假设正常结束
+                            }
+                        ],
+                        "usage": {
+                            "prompt_tokens": last_usage.prompt_tokens if last_usage and hasattr(last_usage, 'prompt_tokens') else 0,
+                            "completion_tokens": last_usage.completion_tokens if last_usage and hasattr(last_usage, 'completion_tokens') else 0,
+                            "total_tokens": last_usage.total_tokens if last_usage and hasattr(last_usage, 'total_tokens') else 0
+                        }
+                    }
+                    
+                    # 添加completion_tokens_details（如果存在）
+                    if last_usage and hasattr(last_usage, 'completion_tokens_details'):
+                        details = {}
+                        # 直接访问属性而不是使用.get()方法
+                        if hasattr(last_usage.completion_tokens_details, 'reasoning_tokens'):
+                            details['reasoning_tokens'] = last_usage.completion_tokens_details.reasoning_tokens
+                        response_data["usage"]["completion_tokens_details"] = details
+                else:
+                    # 非流式模式
+                    if verbose:
+                        logger.info(f"线程 {thread_name} - 使用非流式模式发送请求")
+                    
+                    # 直接发送请求
+                    response = client.chat.completions.create(
+                        messages=messages,
+                        **kwargs
+                    )
+                    
+                    # 将OpenAI响应对象转换为字典
+                    response_data = {
+                        "choices": [
+                            {
+                                "message": {
+                                    "role": response.choices[0].message.role,
+                                    "content": response.choices[0].message.content
+                                },
+                                "index": response.choices[0].index,
+                                "finish_reason": response.choices[0].finish_reason
+                            }
+                        ],
+                        "usage": {
+                            "prompt_tokens": response.usage.prompt_tokens,
+                            "completion_tokens": response.usage.completion_tokens,
+                            "total_tokens": response.usage.total_tokens
+                        }
+                    }
+                
+                # 请求成功，如果当前线程是429重试者，解除限制
+                if is_429_retrier:
+                    if verbose:
+                        logger.info(f"线程 {thread_name} (重试者) - 请求成功，解除全局速率限制...")
+                    rate_limiter.release_rate_limit(current_thread_id)
+                    is_429_retrier = False
+                
+                # 返回成功结果
+                return {'success': True, 'data': response_data}
+                
+            except RateLimitError as e:
+                # 处理429错误
+                error_msg = f"OpenAI SDK速率限制错误 (429): {str(e)}"
+                logger.warning(error_msg)
+                
+                # 处理429错误
+                was_retrier = handle_429_error(current_thread_id, retry_delay, verbose)
+                if was_retrier:
+                    # 标记当前线程为此次调用的429重试者
+                    is_429_retrier = True
+                    if verbose:
+                        logger.info(f"线程 {thread_name} - 已成为重试者，将继续尝试...")
+                else:
+                    if verbose:
+                        logger.info(f"线程 {thread_name} - 不是重试者，已等待限制解除，重新循环检查...")
+                continue  # 无论是否为重试者，都重新开始循环
+                
+            except APITimeoutError as e:
+                # 处理超时错误
+                error_msg = f"OpenAI SDK请求超时: {str(e)}"
+                logger.error(error_msg)
+                attempt += 1
+                result = {'success': False, 'error': error_msg, 'error_code': -4}  # 使用-4表示超时错误
+                # 将在循环末尾重试或退出
+                
+            except APIConnectionError as e:
+                # 处理连接错误
+                error_msg = f"OpenAI SDK连接错误: {str(e)}"
+                logger.error(error_msg)
+                attempt += 1
+                result = {'success': False, 'error': error_msg, 'error_code': -1}
+                # 将在循环末尾重试或退出
+                
+            except OpenAIError as e:
+                # 处理其他OpenAI错误
+                error_msg = f"OpenAI SDK错误: {str(e)}"
+                logger.error(error_msg)
+                attempt += 1
+                # 尝试获取错误代码（如果有）
+                error_code = -2  # 默认错误代码
+                if hasattr(e, 'status_code'):
+                    error_code = e.status_code
+                result = {'success': False, 'error': error_msg, 'error_code': error_code}
+                # 将在循环末尾重试或退出
+                
+            except Exception as e:
+                # 处理其他意外异常
+                error_msg = f"OpenAI SDK调用中发生意外错误: {str(e)}"
+                logger.error(error_msg)
+                attempt += 1
+                result = {'success': False, 'error': error_msg, 'error_code': -3}
+                # 将在循环末尾重试或退出
+            
+            # 4. 检查是否达到最大重试次数（对于非429错误）
+            if attempt >= max_retries:
+                error_msg = f"达到最大重试次数 ({max_retries})，放弃请求 {prompt[:50]}..."
+                logger.error(error_msg)
+                
+                # 确保有完整的错误信息
+                if result is None:
+                    result = {'success': False, 'error': error_msg, 'error_code': -5}
+                elif 'error' not in result or not result['error']:
+                    result['error'] = error_msg
+                    
+                # 返回错误结果，finally块会处理清理
+                return result
+            
+            # 5. 非429错误的重试等待
+            logger.info(f"线程 {thread_name} - {retry_delay} 秒后重试...")
+            time.sleep(retry_delay)
+            # 循环继续
+            
+    finally:
+        # 6. 清理逻辑：如果当前线程是429重试者，但函数即将退出，需要释放全局限制
+        if is_429_retrier and rate_limiter.is_rate_limited():
+            thread_name = threading.current_thread().name
+            logger.info(f"线程 {thread_name} (重试者) - 在finally块中解除速率限制")
+            rate_limiter.release_rate_limit(current_thread_id)

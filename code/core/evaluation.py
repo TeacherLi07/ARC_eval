@@ -8,7 +8,7 @@ from pathlib import Path
 from typing import List, Dict, Any, Optional
 import functools
 
-from .api_handler import call_llm_api, RateLimitWaitingException, DEFAULT
+from .api_handler import call_llm_api, call_llm_api_with_openai_sdk, RateLimitWaitingException, DEFAULT
 from .db_utils import save_results_to_db
 from .utils import extract_output_from_response
 
@@ -50,6 +50,7 @@ DEFAULT_CONFIG = {
     "api_call_interval": 1.0,
     "verbose": False,
     "problem_timeout": 1200, # 单个问题处理超时时间（秒）
+    "use_openai_sdk": False, # 是否使用OpenAI SDK方式调用API
 
     # 默认prompt
     "prompt": """你是一个解决抽象推理问题的AI助手。分析下面的训练示例，理解输入到输出的变换规则。
@@ -283,6 +284,189 @@ def evaluate_problem(problem: Dict[str, Any], config: Dict[str, Any]) -> Dict[st
 
     # 启动处理线程
     process_thread = threading.Thread(target=process_with_timeout, name=f"Problem-{filename}")
+    process_thread.daemon = True
+    
+    try:
+        process_thread.start()
+
+        # 等待完成或超时
+        if not completion_event.wait(timeout=overall_timeout):
+            logger.error(f"处理 {filename} 超时(>{overall_timeout}秒)，强制终止")
+            return {
+                'filename': filename,
+                'success': False,
+                'error': f"处理超时(>{overall_timeout}秒)",
+                'error_code': -101
+            }
+            
+        return result_container[0] if result_container else {
+            'filename': filename,
+            'success': False,
+            'error': "未知错误：处理完成但没有结果",
+            'error_code': -103
+        }
+    except Exception as e:
+        logger.error(f"评估问题 {filename} 时发生未预期异常: {str(e)}", exc_info=True)
+        return {
+            'filename': filename,
+            'success': False,
+            'error': f"评估函数发生异常: {str(e)}",
+            'error_code': -999
+        }
+
+
+def evaluate_problem_with_openai_sdk(problem: Dict[str, Any], config: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    使用OpenAI SDK方式评估单个问题，调用LLM API获取回答并评估正确性。
+    
+    与evaluate_problem函数类似，但使用OpenAI SDK标准进行API调用，支持流式响应。
+    
+    参数:
+        problem: 包含问题内容的字典
+        config: 配置字典，控制API调用行为
+        
+    返回:
+        Dict[str, Any]: 包含评估结果的字典，包括成功/失败状态、预测输出、实际输出等
+    """
+    filename = problem['filename']
+    verbose = config.get("verbose", False)
+    overall_timeout = config.get("problem_timeout", DEFAULT_CONFIG["problem_timeout"])
+
+    if verbose:
+        logger.info(f"开始使用OpenAI SDK处理问题 {filename}...")
+
+    # 使用线程和事件实现超时控制
+    result_container = []
+    completion_event = threading.Event()
+    thread_exception = []  # 用于存储线程中的异常
+    
+    def process_with_timeout():
+        """线程内部函数，处理问题并处理各种异常情况"""
+        # 添加重试循环，允许在速率限制解除后重新尝试
+        retry_count = 0
+        max_retries = config.get("max_retries", DEFAULT_CONFIG["max_retries"])
+
+        while retry_count < max_retries:
+            try:
+                prompt = prepare_problem_prompt(problem, config)
+
+                # 使用OpenAI SDK方式调用API
+                response = call_llm_api_with_openai_sdk(prompt, config, DEFAULT_CONFIG)
+
+                # 处理API调用失败
+                if not response.get('success'):
+                    # 特殊处理速率限制相关的错误
+                    error_code = response.get('error_code', 0)
+                    if error_code == 429 or "rate limit" in response.get('error', '').lower():
+                        if verbose:
+                            logger.info(f"线程 {threading.current_thread().name} - API返回速率限制错误，重试 {filename}")
+                        retry_count += 1
+                        time.sleep(config.get("retry_delay", DEFAULT_CONFIG["retry_delay"])) # 使用配置的延迟
+                        continue
+
+                    logger.error(f"获取 {filename} 的响应失败: {response.get('error')}")
+                    result_container.append({
+                        'filename': filename,
+                        'success': False,
+                        'error': response.get('error', 'OpenAI SDK API调用失败'),
+                        'error_code': error_code
+                    })
+                    completion_event.set() # 确保事件被设置
+                    return
+
+                # 正常处理结果
+                data = response['data']
+                
+                # OpenAI SDK响应结构处理
+                content = data['choices'][0]['message']['content']
+                
+                # 提取reasoning_content
+                reasoning_content = ""
+                if 'reasoning_content' in data['choices'][0]['message']:
+                    reasoning_content = data['choices'][0]['message']['reasoning_content']
+                
+                # 处理token统计信息
+                prompt_token_count = data['usage'].get('prompt_tokens', 0) if 'usage' in data else 0
+                completion_token_count = data['usage'].get('completion_tokens', 0) if 'usage' in data else 0
+                
+                # 获取推理token数量（如果存在）
+                reasoning_token_count = 0
+                if 'usage' in data and 'completion_tokens_details' in data['usage']:
+                    details = data['usage']['completion_tokens_details']
+                    if isinstance(details, dict) and 'reasoning_tokens' in details:
+                        reasoning_token_count = details['reasoning_tokens']
+                    elif hasattr(details, 'reasoning_tokens'):
+                        reasoning_token_count = details.reasoning_tokens
+                
+                if verbose:
+                    logger.info(f"{filename} 的Tokens: {prompt_token_count} + {completion_token_count} = {prompt_token_count + completion_token_count}")
+                    if reasoning_token_count > 0:
+                        logger.info(f"{filename} 的推理Tokens: {reasoning_token_count}")
+
+                predicted_output = extract_output_from_response(response)
+                actual_output = problem['content']['test'][0]['output']  # 假设只使用第一个测试用例
+
+                # 评估结果
+                is_correct = False
+                if predicted_output is not None: # 确保提取到了结果再比较
+                    is_correct = predicted_output == actual_output
+                else:
+                    if verbose:
+                        logger.warning(f"{filename} - 未能成功提取答案")
+
+                if verbose:
+                    logger.info(f"{filename} - 判断结果: {'✓ 正确' if is_correct else '✗ 错误'}")
+
+                result_dict = {
+                    'filename': filename,
+                    'success': True,
+                    'correct': is_correct,
+                    'predicted': predicted_output,
+                    'actual': actual_output,
+                    'reasoning': reasoning_content,  # 使用收集到的reasoning_content
+                    'response': content,
+                    'prompt_tokens': prompt_token_count,
+                    'completion_tokens': completion_token_count,
+                    'reasoning_tokens': reasoning_token_count,  # 添加推理token数量
+                    'error': '',
+                    'error_code': 0
+                }
+                result_container.append(result_dict)
+                break  # 成功处理，退出重试循环
+
+            except Exception as e:
+                # 区分速率限制相关异常和其它异常
+                if "rate limit" in str(e).lower() or "429" in str(e):
+                    if verbose:
+                        logger.info(f"线程 {threading.current_thread().name} - 捕获到速率限制异常，重试 {filename}")
+                    retry_count += 1
+                    time.sleep(config.get("retry_delay", DEFAULT_CONFIG["retry_delay"])) # 使用配置的延迟
+                else:
+                    # 真正的异常，记录并退出
+                    logger.error(f"处理 {filename} 时发生意外错误: {str(e)}", exc_info=True)
+                    result_container.append({
+                        'filename': filename,
+                        'success': False,
+                        'error': f"处理时发生异常: {str(e)}",
+                        'error_code': -100
+                    })
+                    break  # 退出重试循环
+
+        # 检查是否达到最大重试次数
+        if retry_count >= max_retries and not result_container:
+            logger.warning(f"{filename} - 达到最大重试次数 ({max_retries})，放弃请求")
+            result_container.append({
+                'filename': filename,
+                'success': False,
+                'error': f"达到最大重试次数 ({max_retries})，放弃请求",
+                'error_code': -102
+            })
+
+        # 无论成功与否，都设置完成事件
+        completion_event.set()
+
+    # 启动处理线程
+    process_thread = threading.Thread(target=process_with_timeout, name=f"OpenAI-SDK-Problem-{filename}")
     process_thread.daemon = True
     
     try:
@@ -573,4 +757,252 @@ def run_evaluation(
         print(f"警告: 最终结果保存到数据库失败: {str(e)}")
 
     logger.info(f"评估运行 {run_id} 完成，正确率: {run_metadata['accuracy']*100:.2f}%")
+    return run_metadata
+
+
+def run_evaluation_with_openai(
+    problems_dir: str,
+    db_path: str = 'arc_results.db',
+    run_id: str = None,
+    config: Dict[str, Any] = None
+) -> Dict[str, Any]:
+    """
+    使用OpenAI SDK进行评估流程的实验性函数。
+    
+    类似于run_evaluation，但在内部使用call_llm_api_with_openai_sdk进行API调用。
+    支持流式响应和其他OpenAI SDK特性。
+    
+    参数:
+        problems_dir: 问题文件所在目录
+        db_path: 数据库文件路径
+        run_id: 运行ID，如不提供则使用时间戳
+        config: 配置参数，覆盖默认配置
+        
+    返回:
+        Dict[str, Any]: 包含运行结果统计信息的字典
+    """
+    start_time = time.time()
+    logger.info("开始新的OpenAI SDK评估运行...")
+    
+    # 合并配置
+    merged_config = DEFAULT_CONFIG.copy()
+    if config:
+        # 只更新显式提供的非DEFAULT值
+        merged_config.update({k: v for k, v in config.items() if v is not DEFAULT})
+        
+    # 标记使用OpenAI SDK
+    merged_config["use_openai_sdk"] = True
+
+    # 确保API令牌存在
+    if not merged_config.get("api_token"):
+        # 尝试从环境变量获取
+        api_key_env = os.environ.get("SF_API_KEY") or os.environ.get("OPENAI_API_KEY")
+        if api_key_env:
+            merged_config["api_token"] = api_key_env
+            logger.info("从环境变量加载了API Token")
+        else:
+            logger.error("缺少API Token - 必须在配置中提供 'api_token' 或设置 SF_API_KEY/OPENAI_API_KEY 环境变量")
+            raise ValueError("必须在配置中提供 'api_token' 或设置适当的环境变量")
+
+    # 为本次运行生成唯一ID
+    run_id = run_id if run_id else f"openai-sdk-{time.strftime('%Y%m%d_%H%M%S')}"
+
+    # 获取多线程配置
+    max_workers = int(merged_config.get("max_workers", DEFAULT_CONFIG["max_workers"]))
+    save_interval = int(merged_config.get("save_interval", DEFAULT_CONFIG["save_interval"]))
+    verbose = merged_config.get("verbose", DEFAULT_CONFIG["verbose"])
+
+    # 加载问题
+    problems = load_problems(problems_dir)
+    if not problems:
+        logger.error("未能加载任何问题，评估中止。")
+        return {
+            'run_id': run_id,
+            'error': '未能加载任何问题',
+            'total_problems': 0,
+            'successful_count': 0,
+            'correct_count': 0,
+            'accuracy': 0.0
+        }
+
+    results = []
+    completed = 0
+
+    print(f"本次OpenAI SDK运行ID: {run_id}")
+    print(f"并行处理线程数: {max_workers}")
+    logger.info(f"开始OpenAI SDK评估运行 ID:{run_id}, 模型:{merged_config.get('model','未指定')}, 线程数:{max_workers}")
+
+    # 创建线程互斥锁
+    results_lock = threading.Lock()
+    print_lock = threading.Lock()
+
+    # 创建运行元数据
+    run_metadata = {
+        'run_id': run_id,
+        'timestamp': time.strftime('%Y-%m-%d %H:%M:%S'),
+        'model': merged_config.get('model'),
+        'prompt': merged_config.get('prompt'),
+        'problems_dir': problems_dir,
+        'total_problems': len(problems),
+        'config': {k: v for k, v in merged_config.items() if k != 'api_token'},  # 不保存API令牌
+        'results': []  # 将在处理过程中填充
+    }
+
+    # 修改任务包装器，使用OpenAI SDK评估函数
+    def evaluate_problem_wrapper_with_openai(args):
+        problem, config, problem_idx, total_problems, print_lock = args
+        thread_name = threading.current_thread().name
+
+        try:
+            logger.info(f"线程 {thread_name} - 开始使用OpenAI SDK评估问题 {problem_idx+1}/{total_problems}: {problem['filename']}")
+            result = evaluate_problem_with_openai_sdk(problem, config)
+
+            # 打印结果状态
+            with print_lock:
+                if result['success']:
+                    status = "✓ 正确" if result['correct'] else "✗ 错误"
+                else:
+                    status = f"! 处理失败 (错误码: {result.get('error_code', 0)})"
+                print(f"\n问题 {problem_idx+1}/{total_problems} - {problem['filename']} 结果: {status}")
+
+            logger.info(f"线程 {thread_name} - 完成OpenAI SDK评估问题 {problem['filename']} - 结果: {status}")
+            return result
+
+        except Exception as e:
+            error_msg = f"处理问题 {problem['filename']} 时发生顶层错误: {str(e)}"
+            with print_lock:
+                print(error_msg)
+
+            logger.error(f"线程 {thread_name} - {error_msg}", exc_info=True)
+            return {
+                'filename': problem['filename'],
+                'success': False,
+                'error': error_msg,
+                'error_code': -999  # 未预期的错误
+            }
+
+    # 准备任务参数
+    tasks = [(problem, merged_config, i, len(problems), print_lock)
+             for i, problem in enumerate(problems)]
+             
+    # 确保数据库连接正常初始化
+    try:
+        # 提前尝试保存一次，确认数据库正常
+        initial_metadata = run_metadata.copy()
+        initial_metadata['results'] = []  # 空结果列表
+        save_results_to_db(db_path, initial_metadata)
+        logger.info(f"数据库连接测试成功: {db_path}")
+    except Exception as e:
+        logger.error(f"数据库连接测试失败: {str(e)}", exc_info=True)
+        print(f"警告: 数据库连接或初始保存失败，评估将继续但结果可能无法保存: {str(e)}")
+
+    # 如果是单线程模式，顺序处理
+    if max_workers <= 1:
+        logger.info("以单线程模式运行OpenAI SDK评估...")
+        print("以单线程模式运行OpenAI SDK评估...")
+        for task in tasks:
+            result = evaluate_problem_wrapper_with_openai(task)
+            with results_lock:
+                results.append(result)
+                run_metadata['results'].append(result)
+                completed += 1
+
+                # 定期保存中间结果
+                if completed % save_interval == 0 or completed == len(problems):
+                    try:
+                        save_results_to_db(db_path, run_metadata)
+                        logger.info(f"已完成: {completed}/{len(problems)} - 已保存结果到数据库")
+                        print(f"已完成: {completed}/{len(problems)} - 已保存结果到数据库 {db_path}")
+                    except Exception as e:
+                        logger.error(f"保存到数据库失败: {str(e)}", exc_info=True)
+    else:
+        # 多线程模式
+        logger.info(f"以多线程模式运行OpenAI SDK评估 (max_workers={max_workers})...")
+        print(f"以多线程模式运行OpenAI SDK评估 (max_workers={max_workers})...")
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            # 提交所有任务
+            future_to_idx = {executor.submit(evaluate_problem_wrapper_with_openai, task): i
+                            for i, task in enumerate(tasks)}
+
+            # 处理完成的任务
+            for future in as_completed(future_to_idx):
+                idx = future_to_idx[future]
+
+                try:
+                    result = future.result()
+                    with results_lock:
+                        results.append(result)
+                        run_metadata['results'].append(result)
+                        completed += 1
+
+                        # 定期保存中间结果
+                        if completed % save_interval == 0 or completed == len(problems):
+                            try:
+                                save_results_to_db(db_path, run_metadata)
+                                logger.info(f"已完成: {completed}/{len(problems)} - 已保存结果到数据库")
+                                print(f"已完成: {completed}/{len(problems)} - 已保存结果到数据库 {db_path}")
+                            except Exception as e:
+                                logger.error(f"保存到数据库失败: {str(e)}", exc_info=True)
+
+                except Exception as e:
+                    # 捕获 future.result() 可能抛出的异常
+                    error_msg = f"处理问题 {problems[idx]['filename']} 时线程池发生错误: {str(e)}"
+                    logger.error(error_msg, exc_info=True)
+                    print(error_msg)
+
+                    error_result = {
+                        'filename': problems[idx]['filename'],
+                        'success': False,
+                        'error': error_msg,
+                        'error_code': -998 # 线程池层面的错误
+                    }
+
+                    with results_lock:
+                        results.append(error_result)
+                        run_metadata['results'].append(error_result)
+                        completed += 1
+                        # 即使出错也尝试保存
+                        if completed % save_interval == 0 or completed == len(problems):
+                            try:
+                                save_results_to_db(db_path, run_metadata)
+                                logger.info(f"已完成: {completed}/{len(problems)} - 已保存结果(含错误)到数据库")
+                            except Exception as e:
+                                logger.error(f"保存到数据库失败: {str(e)}", exc_info=True)
+
+
+    # 计算整体统计
+    successful_results = [r for r in results if r.get('success', False)]
+    correct_count = sum(1 for r in successful_results if r.get('correct', False))
+    prompt_tokens_sum = sum(r.get('prompt_tokens', 0) for r in successful_results)
+    completion_tokens_sum = sum(r.get('completion_tokens', 0) for r in successful_results)
+
+    # 更新运行元数据中的统计信息
+    run_metadata['successful_count'] = len(successful_results)
+    run_metadata['correct_count'] = correct_count
+    # 避免除零错误
+    total_processed = len(results) # 使用总处理数作为分母更合理
+    run_metadata['accuracy'] = correct_count / total_processed if total_processed > 0 else 0.0
+    run_metadata['prompt_tokens_sum'] = prompt_tokens_sum
+    run_metadata['completion_tokens_sum'] = completion_tokens_sum
+    run_metadata['total_tokens'] = prompt_tokens_sum + completion_tokens_sum
+    run_metadata['completed_at'] = time.strftime('%Y-%m-%d %H:%M:%S')
+    run_metadata['execution_time'] = round(time.time() - start_time, 2)  # 记录总执行时间
+
+    print(f"\nOpenAI SDK评估总体结果:")
+    print(f"总问题数: {len(problems)}")
+    print(f"成功处理: {len(successful_results)}/{total_processed}")
+    print(f"正确: {correct_count}/{total_processed} ({run_metadata['accuracy']*100:.2f}%)" if total_processed > 0 else "无处理结果")
+    print(f"总prompt tokens: {prompt_tokens_sum}， 总completion tokens: {completion_tokens_sum}， token总量: {prompt_tokens_sum+completion_tokens_sum}")
+    print(f"执行时间: {run_metadata['execution_time']}秒")
+
+    # 保存最终结果
+    try:
+        save_results_to_db(db_path, run_metadata)
+        logger.info(f"最终结果已保存到数据库 {db_path}")
+        print(f"最终结果已保存到数据库 {db_path}")
+    except Exception as e:
+        logger.error(f"最终保存到数据库失败: {str(e)}", exc_info=True)
+        print(f"警告: 最终结果保存到数据库失败: {str(e)}")
+
+    logger.info(f"OpenAI SDK评估运行 {run_id} 完成，正确率: {run_metadata['accuracy']*100:.2f}%")
     return run_metadata
