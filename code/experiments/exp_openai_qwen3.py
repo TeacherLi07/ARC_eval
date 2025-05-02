@@ -28,22 +28,22 @@ print = functools.partial(print, flush=True)
 
 # 使用相对路径或基于项目根的路径
 problems_path = project_root / "data" / "ARC-AGI-1" / "data" / "evaluation"
-db_path = project_root / "results"/ "openai_sdk_test.db"
+db_path = project_root / "results"/ "qwen3.db"
 
 # 使用OpenAI SDK方式进行测试评测
 result = run_evaluation_with_openai(
     problems_dir=str(problems_path),
     db_path=str(db_path),
-    run_id=f"openai-sdk-test-{uuid.uuid4().hex[:6]}",
+    run_id=f"qwen3-{uuid.uuid4().hex[:6]}",
     config = {
         # API配置 (api_token 会自动从环境变量加载)
         "api_url": "https://api.siliconflow.cn/v1",
         # "api_token": api_key, # 不再需要显式传递
         
         # 模型配置
-        "model": "deepseek-ai/DeepSeek-R1-Distill-Qwen-7B", # Qwen/QwQ-32B
+        "model": "Qwen/Qwen3-8B", # Qwen/QwQ-32B
         "stream": True, # 使用默认值 False
-        "max_tokens": 16384, # 增加 max_tokens
+        "max_tokens": 8192, # 增加 max_tokens
         "temperature": 1.0, 
         # "top_p": DEFAULT, # 使用默认值 0.7
         # "top_k": DEFAULT, # 使用默认值 50
@@ -55,12 +55,14 @@ result = run_evaluation_with_openai(
         #     "prefix": "```json\n",
         #     },
         # "stop": DEFAULT, # 使用默认值
+        "enable_thinking": True,
+        "thinking_budget": 38512,
         
         # 运行配置
-        "max_workers": 2, # 设置 max_workers
+        "max_workers": 12, # 设置 max_workers
         # "save_interval": DEFAULT, # 使用默认值 1
         # "retry_delay": DEFAULT, # 使用默认值 5
-        "max_retries": 5, # 设置 max_retries
+        "max_retries": 20, # 设置 max_retries
         # "api_call_interval": DEFAULT, # 使用默认值 1.0
         "verbose": True, # 启用详细输出
 

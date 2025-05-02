@@ -41,6 +41,8 @@ DEFAULT_CONFIG = {
     "response_format": {"type": "text"},
     "extra_body": DEFAULT,
     "stop": DEFAULT,
+    "enable_thinking": DEFAULT,
+    "thinking_budget": DEFAULT, # 38512
 
     # 运行配置
     "max_workers": 12,

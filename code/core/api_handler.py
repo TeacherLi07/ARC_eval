@@ -343,7 +343,7 @@ def prepare_api_request(prompt: str, config: Dict[str, Any], default_config: Dic
 
     # 动态添加API参数配置项
     for param in ["model", "stream", "max_tokens", "temperature", "top_p", "top_k",
-                  "frequency_penalty", "n", "response_format", "stop"]:
+                  "frequency_penalty", "n", "response_format", "stop", "enable_thinking", "thinking_budget"]:
         value = config.get(param, DEFAULT)
         if value is not DEFAULT:
             payload[param] = value
